@@ -5,28 +5,78 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	baseURL = "https://api.zone.eu/v2"
+	defaultBaseURL = "https://api.zone.eu/v2"
 
 	// Rate limiting constants
 	defaultRateLimit     = 60 // requests per minute
 	rateLimitResetPeriod = time.Minute
 	maxRetries           = 3
-	retryBaseDelay       = time.Second
 )
+
+// DNS record types, as they appear in the /dns/{zone}/{type} API paths.
+const (
+	recordTypeA     = "a"
+	recordTypeAAAA  = "aaaa"
+	recordTypeCAA   = "caa"
+	recordTypeCNAME = "cname"
+	recordTypeMX    = "mx"
+	recordTypeNS    = "ns"
+	recordTypeSRV   = "srv"
+	recordTypeSSHFP = "sshfp"
+	recordTypeTLSA  = "tlsa"
+	recordTypeTXT   = "txt"
+	recordTypeURL   = "url"
+)
+
+// errNotFound is returned when the API answers 404, or answers a single-object
+// GET with an empty array.
+var errNotFound = errors.New("not found")
+
+// APIError is a non-2xx response from the Zone.EU API.
+//
+// Validation errors (422) come back shaped like the resource being written,
+// e.g. {"name":"invalid_host"}, not like the ErrorResponse schema the spec
+// declares, so the body is kept verbatim rather than parsed.
+type APIError struct {
+	StatusCode    int
+	Body          string
+	StatusMessage string
+}
+
+func (e *APIError) Error() string {
+	if e.StatusMessage != "" {
+		return fmt.Sprintf("API error (status %d): %s (X-Status-Message: %s)", e.StatusCode, e.Body, e.StatusMessage)
+	}
+	return fmt.Sprintf("API error (status %d): %s", e.StatusCode, e.Body)
+}
+
+func (e *APIError) Unwrap() error {
+	if e.StatusCode == http.StatusNotFound {
+		return errNotFound
+	}
+	return nil
+}
+
+// isNotFound reports whether err means the requested object does not exist.
+func isNotFound(err error) bool {
+	return errors.Is(err, errNotFound)
+}
 
 // Client represents the Zone.EU API client
 type Client struct {
 	httpClient *http.Client
+	baseURL    string
 	username   string
 	apiKey     string
 
@@ -41,6 +91,7 @@ type Client struct {
 func NewClient(username, apiKey string) *Client {
 	return &Client{
 		httpClient:         &http.Client{Timeout: 30 * time.Second},
+		baseURL:            defaultBaseURL,
 		username:           username,
 		apiKey:             apiKey,
 		rateLimitLimit:     defaultRateLimit,
@@ -54,30 +105,17 @@ func (c *Client) authHeader() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(auth))
 }
 
-// parseDNSRecordResponse parses the API response which always returns an array
-// and extracts the first element
-func parseDNSRecordResponse(resp []byte) (*DNSRecord, error) {
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
+// parseSingle parses a single-object response. The API wraps single objects
+// in a one-element array; an empty array means the object does not exist.
+func parseSingle[T any](resp []byte) (*T, error) {
+	var items []T
+	if err := json.Unmarshal(resp, &items); err != nil {
 		return nil, fmt.Errorf("error parsing response: %w", err)
 	}
-	if len(records) == 0 {
-		return nil, fmt.Errorf("empty response from API")
+	if len(items) == 0 {
+		return nil, errNotFound
 	}
-	return &records[0], nil
-}
-
-// parseDNSZoneResponse parses the API response which always returns an array
-// and extracts the first element
-func parseDNSZoneResponse(resp []byte) (*DNSZone, error) {
-	var zones []DNSZone
-	if err := json.Unmarshal(resp, &zones); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	if len(zones) == 0 {
-		return nil, fmt.Errorf("empty response from API")
-	}
-	return &zones[0], nil
+	return &items[0], nil
 }
 
 // updateRateLimitInfo updates rate limit info from response headers
@@ -99,66 +137,56 @@ func (c *Client) updateRateLimitInfo(resp *http.Response) {
 }
 
 // waitForRateLimit waits if we've hit the rate limit
-func (c *Client) waitForRateLimit() {
+func (c *Client) waitForRateLimit(ctx context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	remaining, resetAt := c.rateLimitRemaining, c.rateLimitResetAt
+	c.mu.Unlock()
 
-	// If we have remaining requests, no need to wait
-	if c.rateLimitRemaining > 0 {
-		return
+	if remaining > 0 {
+		return nil
 	}
+	return sleepCtx(ctx, time.Until(resetAt))
+}
 
-	// Calculate wait time until reset
-	now := time.Now()
-	if c.rateLimitResetAt.After(now) {
-		waitDuration := c.rateLimitResetAt.Sub(now)
-		c.mu.Unlock()
-		time.Sleep(waitDuration)
-		c.mu.Lock()
+// sleepCtx sleeps for d or until ctx is cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
-// doRequest performs an HTTP request with authentication and rate limiting
-// Uses context.Background() for backward compatibility - prefer doRequestWithContext for new code
-func (c *Client) doRequest(method, path string, body interface{}) ([]byte, error) {
-	return c.doRequestWithContext(context.Background(), method, path, body)
-}
-
-// doRequestWithContext performs an HTTP request with authentication, rate limiting, and context support
-func (c *Client) doRequestWithContext(ctx context.Context, method, path string, body interface{}) ([]byte, error) {
+// doRequest performs an HTTP request with authentication, rate limiting, and context support
+func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}) ([]byte, error) {
 	var lastErr error
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Check for context cancellation
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
+		if err := c.waitForRateLimit(ctx); err != nil {
+			return nil, err
 		}
-
-		// Wait if we've hit rate limit
-		c.waitForRateLimit()
 
 		result, err := c.doRequestOnce(ctx, method, path, body)
 		if err == nil {
 			return result, nil
 		}
 
-		// Check if it's a rate limit error
-		if rateLimitErr, ok := err.(*RateLimitError); ok {
-			// Set reset time and wait
-			c.mu.Lock()
-			c.rateLimitRemaining = 0
-			c.rateLimitResetAt = time.Now().Add(rateLimitErr.RetryAfter)
-			c.mu.Unlock()
-
-			lastErr = err
-			time.Sleep(rateLimitErr.RetryAfter)
-			continue
+		var rateLimitErr *RateLimitError
+		if !errors.As(err, &rateLimitErr) {
+			return nil, err
 		}
 
-		// For other errors, return immediately
-		return nil, err
+		c.mu.Lock()
+		c.rateLimitRemaining = 0
+		c.rateLimitResetAt = time.Now().Add(rateLimitErr.RetryAfter)
+		c.mu.Unlock()
+		lastErr = err
 	}
 
 	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
@@ -185,7 +213,7 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body in
 		bodyReader = bytes.NewBuffer(jsonBody)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -198,9 +226,8 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body in
 	if err != nil {
 		return nil, fmt.Errorf("error performing request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
-	// Update rate limit info from headers
 	c.updateRateLimitInfo(resp)
 
 	respBody, err := io.ReadAll(resp.Body)
@@ -208,35 +235,35 @@ func (c *Client) doRequestOnce(ctx context.Context, method, path string, body in
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
 
-	// Handle rate limiting (429 Too Many Requests)
 	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfter := rateLimitResetPeriod // default to 1 minute
+		retryAfter := rateLimitResetPeriod
 		if retryHeader := resp.Header.Get("Retry-After"); retryHeader != "" {
 			if seconds, err := strconv.Atoi(retryHeader); err == nil {
 				retryAfter = time.Duration(seconds) * time.Second
 			}
 		}
-		statusMsg := resp.Header.Get("X-Status-Message")
 		return nil, &RateLimitError{
 			RetryAfter: retryAfter,
-			Message:    statusMsg,
+			Message:    resp.Header.Get("X-Status-Message"),
 		}
 	}
 
-	// Handle other error status codes
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		statusMsg := resp.Header.Get("X-Status-Message")
-		errMsg := string(respBody)
-		if statusMsg != "" {
-			errMsg = fmt.Sprintf("%s (X-Status-Message: %s)", errMsg, statusMsg)
+		return nil, &APIError{
+			StatusCode:    resp.StatusCode,
+			Body:          string(respBody),
+			StatusMessage: resp.Header.Get("X-Status-Message"),
 		}
-		return nil, fmt.Errorf("API error (status %d): %s", resp.StatusCode, errMsg)
 	}
 
 	return respBody, nil
 }
 
-// DNSRecord represents a generic DNS record
+// DNSRecord represents a generic DNS record.
+//
+// Name is always a fully-qualified name: the API returns FQDNs (the apex as the
+// bare zone name) and rejects short names on write with 422 invalid_host.
+// There is no TTL field; Zone.EU fixes TTL server-side.
 type DNSRecord struct {
 	ID          string `json:"id,omitempty"`
 	Name        string `json:"name"`
@@ -265,28 +292,20 @@ type DNSZone struct {
 	IPv6   bool   `json:"ipv6"`
 }
 
-// GetZone retrieves zone information
-func (c *Client) GetZone(zone string) (*DNSZone, error) {
-	resp, err := c.doRequest("GET", fmt.Sprintf("/dns/%s", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var z DNSZone
-	if err := json.Unmarshal(resp, &z); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return &z, nil
+func recordsPath(zone, recordType string) string {
+	return fmt.Sprintf("/dns/%s/%s", url.PathEscape(zone), recordType)
 }
 
-// ==================== A Records ====================
-
-// ListARecords retrieves all A records for a zone
-func (c *Client) ListARecords(zone string) ([]DNSRecord, error) {
-	return c.ListARecordsWithContext(context.Background(), zone)
+func recordPath(zone, recordType, id string) string {
+	return recordsPath(zone, recordType) + "/" + url.PathEscape(id)
 }
 
-func (c *Client) ListARecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/a", zone), nil)
+// ==================== DNS Records ====================
+
+// ListRecords retrieves all records of a type in a zone. DNS record lists are
+// not paginated.
+func (c *Client) ListRecords(ctx context.Context, recordType, zone string) ([]DNSRecord, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, recordsPath(zone, recordType), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -297,1263 +316,48 @@ func (c *Client) ListARecordsWithContext(ctx context.Context, zone string) ([]DN
 	return records, nil
 }
 
-// FindARecordByName finds an A record by name in a zone
-func (c *Client) FindARecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindARecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindARecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListARecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllARecordsByName finds ALL A records with matching name in a zone
-func (c *Client) FindAllARecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllARecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllARecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListARecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetARecord(zone, id string) (*DNSRecord, error) {
-	return c.GetARecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetARecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/a/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateARecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateARecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateARecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/a", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateARecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateARecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateARecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/a/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteARecord(zone, id string) error {
-	return c.DeleteARecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteARecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/a/%s", zone, id), nil)
-	return err
-}
-
-// ==================== AAAA Records ====================
-
-// ListAAAARecords retrieves all AAAA records for a zone
-func (c *Client) ListAAAARecords(zone string) ([]DNSRecord, error) {
-	return c.ListAAAARecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListAAAARecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/aaaa", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindAAAARecordByName finds an AAAA record by name in a zone
-func (c *Client) FindAAAARecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindAAAARecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAAAARecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListAAAARecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllAAAARecordsByName finds ALL AAAA records with matching name in a zone
-func (c *Client) FindAllAAAARecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllAAAARecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllAAAARecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListAAAARecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetAAAARecord(zone, id string) (*DNSRecord, error) {
-	return c.GetAAAARecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetAAAARecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/aaaa/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateAAAARecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateAAAARecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateAAAARecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/aaaa", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateAAAARecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateAAAARecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateAAAARecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/aaaa/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteAAAARecord(zone, id string) error {
-	return c.DeleteAAAARecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteAAAARecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/aaaa/%s", zone, id), nil)
-	return err
-}
-
-// ==================== CNAME Records ====================
-
-// ListCNAMERecords retrieves all CNAME records for a zone
-func (c *Client) ListCNAMERecords(zone string) ([]DNSRecord, error) {
-	return c.ListCNAMERecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListCNAMERecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/cname", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindCNAMERecordByName finds a CNAME record by name in a zone
-func (c *Client) FindCNAMERecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindCNAMERecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindCNAMERecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListCNAMERecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllCNAMERecordsByName finds ALL CNAME records with matching name in a zone
-func (c *Client) FindAllCNAMERecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllCNAMERecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllCNAMERecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListCNAMERecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetCNAMERecord(zone, id string) (*DNSRecord, error) {
-	return c.GetCNAMERecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetCNAMERecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/cname/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateCNAMERecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateCNAMERecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateCNAMERecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/cname", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateCNAMERecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateCNAMERecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateCNAMERecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/cname/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteCNAMERecord(zone, id string) error {
-	return c.DeleteCNAMERecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteCNAMERecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/cname/%s", zone, id), nil)
-	return err
-}
-
-// ==================== MX Records ====================
-
-// ListMXRecords retrieves all MX records for a zone
-func (c *Client) ListMXRecords(zone string) ([]DNSRecord, error) {
-	return c.ListMXRecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListMXRecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/mx", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindMXRecordByName finds an MX record by name in a zone
-func (c *Client) FindMXRecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindMXRecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindMXRecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListMXRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllMXRecordsByName finds ALL MX records with matching name in a zone
-func (c *Client) FindAllMXRecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllMXRecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllMXRecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListMXRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetMXRecord(zone, id string) (*DNSRecord, error) {
-	return c.GetMXRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetMXRecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/mx/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateMXRecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateMXRecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateMXRecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/mx", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateMXRecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateMXRecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateMXRecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/mx/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteMXRecord(zone, id string) error {
-	return c.DeleteMXRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteMXRecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/mx/%s", zone, id), nil)
-	return err
-}
-
-// ==================== TXT Records ====================
-
-// ListTXTRecords retrieves all TXT records for a zone
-func (c *Client) ListTXTRecords(zone string) ([]DNSRecord, error) {
-	return c.ListTXTRecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListTXTRecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/txt", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindTXTRecordByName finds a TXT record by name in a zone
-func (c *Client) FindTXTRecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindTXTRecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindTXTRecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListTXTRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllTXTRecordsByName finds ALL TXT records with matching name in a zone
-func (c *Client) FindAllTXTRecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllTXTRecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllTXTRecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListTXTRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetTXTRecord(zone, id string) (*DNSRecord, error) {
-	return c.GetTXTRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetTXTRecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/txt/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateTXTRecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateTXTRecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateTXTRecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/txt", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateTXTRecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateTXTRecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateTXTRecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/txt/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteTXTRecord(zone, id string) error {
-	return c.DeleteTXTRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteTXTRecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/txt/%s", zone, id), nil)
-	return err
-}
-
-// ==================== NS Records ====================
-
-// ListNSRecords retrieves all NS records for a zone
-func (c *Client) ListNSRecords(zone string) ([]DNSRecord, error) {
-	return c.ListNSRecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListNSRecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/ns", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindNSRecordByName finds an NS record by name in a zone
-func (c *Client) FindNSRecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindNSRecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindNSRecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListNSRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllNSRecordsByName finds ALL NS records with matching name in a zone
-func (c *Client) FindAllNSRecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllNSRecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllNSRecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListNSRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetNSRecord(zone, id string) (*DNSRecord, error) {
-	return c.GetNSRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetNSRecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/ns/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateNSRecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateNSRecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateNSRecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/ns", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateNSRecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateNSRecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateNSRecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/ns/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteNSRecord(zone, id string) error {
-	return c.DeleteNSRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteNSRecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/ns/%s", zone, id), nil)
-	return err
-}
-
-// ==================== SRV Records ====================
-
-// ListSRVRecords retrieves all SRV records for a zone
-func (c *Client) ListSRVRecords(zone string) ([]DNSRecord, error) {
-	return c.ListSRVRecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListSRVRecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/srv", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindSRVRecordByName finds an SRV record by name in a zone
-func (c *Client) FindSRVRecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindSRVRecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindSRVRecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListSRVRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllSRVRecordsByName finds ALL SRV records with matching name in a zone
-func (c *Client) FindAllSRVRecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllSRVRecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllSRVRecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListSRVRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetSRVRecord(zone, id string) (*DNSRecord, error) {
-	return c.GetSRVRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetSRVRecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/srv/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateSRVRecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateSRVRecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateSRVRecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/srv", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateSRVRecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateSRVRecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateSRVRecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/srv/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteSRVRecord(zone, id string) error {
-	return c.DeleteSRVRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteSRVRecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/srv/%s", zone, id), nil)
-	return err
-}
-
-// ==================== CAA Records ====================
-
-// ListCAARecords retrieves all CAA records for a zone
-func (c *Client) ListCAARecords(zone string) ([]DNSRecord, error) {
-	return c.ListCAARecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListCAARecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/caa", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindCAARecordByName finds a CAA record by name in a zone
-func (c *Client) FindCAARecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindCAARecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindCAARecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListCAARecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllCAARecordsByName finds ALL CAA records with matching name in a zone
-func (c *Client) FindAllCAARecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllCAARecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllCAARecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListCAARecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetCAARecord(zone, id string) (*DNSRecord, error) {
-	return c.GetCAARecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetCAARecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/caa/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateCAARecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateCAARecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateCAARecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/caa", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateCAARecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateCAARecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateCAARecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/caa/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteCAARecord(zone, id string) error {
-	return c.DeleteCAARecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteCAARecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/caa/%s", zone, id), nil)
-	return err
-}
-
-// ==================== TLSA Records ====================
-
-// ListTLSARecords retrieves all TLSA records for a zone
-func (c *Client) ListTLSARecords(zone string) ([]DNSRecord, error) {
-	return c.ListTLSARecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListTLSARecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/tlsa", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindTLSARecordByName finds a TLSA record by name in a zone
-func (c *Client) FindTLSARecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindTLSARecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindTLSARecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListTLSARecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllTLSARecordsByName finds ALL TLSA records with matching name in a zone
-func (c *Client) FindAllTLSARecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllTLSARecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllTLSARecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListTLSARecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetTLSARecord(zone, id string) (*DNSRecord, error) {
-	return c.GetTLSARecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetTLSARecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/tlsa/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateTLSARecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateTLSARecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateTLSARecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/tlsa", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateTLSARecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateTLSARecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateTLSARecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/tlsa/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteTLSARecord(zone, id string) error {
-	return c.DeleteTLSARecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteTLSARecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/tlsa/%s", zone, id), nil)
-	return err
-}
-
-// ==================== SSHFP Records ====================
-
-// ListSSHFPRecords retrieves all SSHFP records for a zone
-func (c *Client) ListSSHFPRecords(zone string) ([]DNSRecord, error) {
-	return c.ListSSHFPRecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListSSHFPRecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/sshfp", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindSSHFPRecordByName finds an SSHFP record by name in a zone
-func (c *Client) FindSSHFPRecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindSSHFPRecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindSSHFPRecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListSSHFPRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllSSHFPRecordsByName finds ALL SSHFP records with matching name in a zone
-func (c *Client) FindAllSSHFPRecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllSSHFPRecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllSSHFPRecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListSSHFPRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetSSHFPRecord(zone, id string) (*DNSRecord, error) {
-	return c.GetSSHFPRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetSSHFPRecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/sshfp/%s", zone, id), nil)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateSSHFPRecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateSSHFPRecordWithContext(context.Background(), zone, record)
-}
-
-func (c *Client) CreateSSHFPRecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/sshfp", zone), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateSSHFPRecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateSSHFPRecordWithContext(context.Background(), zone, id, record)
-}
-
-func (c *Client) UpdateSSHFPRecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/sshfp/%s", zone, id), record)
-	if err != nil {
-		return nil, err
-	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteSSHFPRecord(zone, id string) error {
-	return c.DeleteSSHFPRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) DeleteSSHFPRecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/sshfp/%s", zone, id), nil)
-	return err
-}
-
-// ==================== URL Records ====================
-
-// ListURLRecords retrieves all URL records for a zone
-func (c *Client) ListURLRecords(zone string) ([]DNSRecord, error) {
-	return c.ListURLRecordsWithContext(context.Background(), zone)
-}
-
-func (c *Client) ListURLRecordsWithContext(ctx context.Context, zone string) ([]DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/url", zone), nil)
-	if err != nil {
-		return nil, err
-	}
-	var records []DNSRecord
-	if err := json.Unmarshal(resp, &records); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return records, nil
-}
-
-// FindURLRecordByName finds a URL record by name in a zone
-func (c *Client) FindURLRecordByName(zone, name string) (*DNSRecord, error) {
-	return c.FindURLRecordByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindURLRecordByNameWithContext(ctx context.Context, zone, name string) (*DNSRecord, error) {
-	records, err := c.ListURLRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-	
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			return &r, nil
-		}
-	}
-	return nil, nil // Not found
-}
-
-// FindAllURLRecordsByName finds ALL URL records with matching name in a zone
-func (c *Client) FindAllURLRecordsByName(zone, name string) ([]DNSRecord, error) {
-	return c.FindAllURLRecordsByNameWithContext(context.Background(), zone, name)
-}
-
-func (c *Client) FindAllURLRecordsByNameWithContext(ctx context.Context, zone, name string) ([]DNSRecord, error) {
-	records, err := c.ListURLRecordsWithContext(ctx, zone)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize the search name - strip zone suffix if present
-	zoneSuffix := "." + zone
-	searchName := strings.TrimSuffix(name, zoneSuffix)
-
-	var matches []DNSRecord
-	for _, r := range records {
-		// Normalize the record name as well
-		recordName := strings.TrimSuffix(r.Name, zoneSuffix)
-		if recordName == searchName || r.Name == name {
-			matches = append(matches, r)
-		}
-	}
-	return matches, nil
-}
-
-func (c *Client) GetURLRecord(zone, id string) (*DNSRecord, error) {
-	return c.GetURLRecordWithContext(context.Background(), zone, id)
-}
-
-func (c *Client) GetURLRecordWithContext(ctx context.Context, zone, id string) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "GET", fmt.Sprintf("/dns/%s/url/%s", zone, id), nil)
+func (c *Client) GetRecord(ctx context.Context, recordType, zone, id string) (*DNSRecord, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, recordPath(zone, recordType, id), nil)
 	if err != nil {
 		return nil, err
 	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) CreateURLRecord(zone string, record *DNSRecord) (*DNSRecord, error) {
-	return c.CreateURLRecordWithContext(context.Background(), zone, record)
+	return parseSingle[DNSRecord](resp)
 }
 
-func (c *Client) CreateURLRecordWithContext(ctx context.Context, zone string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "POST", fmt.Sprintf("/dns/%s/url", zone), record)
+func (c *Client) CreateRecord(ctx context.Context, recordType, zone string, record *DNSRecord) (*DNSRecord, error) {
+	resp, err := c.doRequest(ctx, http.MethodPost, recordsPath(zone, recordType), record)
 	if err != nil {
 		return nil, err
 	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) UpdateURLRecord(zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	return c.UpdateURLRecordWithContext(context.Background(), zone, id, record)
+	return parseSingle[DNSRecord](resp)
 }
 
-func (c *Client) UpdateURLRecordWithContext(ctx context.Context, zone, id string, record *DNSRecord) (*DNSRecord, error) {
-	resp, err := c.doRequestWithContext(ctx, "PUT", fmt.Sprintf("/dns/%s/url/%s", zone, id), record)
+// UpdateRecord updates a record. PUT merges: fields omitted from the body keep
+// their current value.
+func (c *Client) UpdateRecord(ctx context.Context, recordType, zone, id string, record *DNSRecord) (*DNSRecord, error) {
+	resp, err := c.doRequest(ctx, http.MethodPut, recordPath(zone, recordType, id), record)
 	if err != nil {
 		return nil, err
 	}
-	return parseDNSRecordResponse(resp)
-}
-
-func (c *Client) DeleteURLRecord(zone, id string) error {
-	return c.DeleteURLRecordWithContext(context.Background(), zone, id)
+	return parseSingle[DNSRecord](resp)
 }
 
-func (c *Client) DeleteURLRecordWithContext(ctx context.Context, zone, id string) error {
-	_, err := c.doRequestWithContext(ctx, "DELETE", fmt.Sprintf("/dns/%s/url/%s", zone, id), nil)
+func (c *Client) DeleteRecord(ctx context.Context, recordType, zone, id string) error {
+	_, err := c.doRequest(ctx, http.MethodDelete, recordPath(zone, recordType, id), nil)
 	return err
 }
 
 // ==================== DNS Zone ====================
 
-func (c *Client) GetDNSZone(zone string) (*DNSZone, error) {
-	resp, err := c.doRequest("GET", fmt.Sprintf("/dns/%s", zone), nil)
+func (c *Client) GetDNSZone(ctx context.Context, zone string) (*DNSZone, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/dns/"+url.PathEscape(zone), nil)
 	if err != nil {
 		return nil, err
 	}
-	return parseDNSZoneResponse(resp)
+	return parseSingle[DNSZone](resp)
 }
 
-// ==================== Domain Management ====================
+// ==================== Domain ====================
 
 // Domain represents a domain in Zone.EU
 type Domain struct {
@@ -1573,164 +377,26 @@ type Domain struct {
 	NameserversCustom    bool   `json:"nameservers_custom"`
 }
 
-// DomainUpdate represents the updateable fields for a domain
-type DomainUpdate struct {
-	Autorenew         *bool `json:"autorenew,omitempty"`
-	DNSSEC            *bool `json:"dnssec,omitempty"`
-	NameserversCustom *bool `json:"nameservers_custom,omitempty"`
-}
-
 // DomainPreferences represents domain preferences
 type DomainPreferences struct {
 	ResourceURL          string `json:"resource_url,omitempty"`
 	RenewalNotifications bool   `json:"renewal_notifications"`
 }
 
-// DomainNameserver represents a domain nameserver
-type DomainNameserver struct {
-	ResourceURL string   `json:"resource_url,omitempty"`
-	Hostname    string   `json:"hostname"`
-	IP          []string `json:"ip,omitempty"`
-}
-
-// GetDomains retrieves all domains
-func (c *Client) GetDomains() ([]Domain, error) {
-	resp, err := c.doRequest("GET", "/domain", nil)
-	if err != nil {
-		return nil, err
-	}
-	var domains []Domain
-	if err := json.Unmarshal(resp, &domains); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return domains, nil
-}
-
 // GetDomain retrieves a specific domain
-func (c *Client) GetDomain(name string) (*Domain, error) {
-	resp, err := c.doRequest("GET", fmt.Sprintf("/domain/%s", name), nil)
+func (c *Client) GetDomain(ctx context.Context, name string) (*Domain, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/domain/"+url.PathEscape(name), nil)
 	if err != nil {
 		return nil, err
 	}
-	// API returns array with single element
-	var domains []Domain
-	if err := json.Unmarshal(resp, &domains); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	if len(domains) == 0 {
-		return nil, fmt.Errorf("domain not found: %s", name)
-	}
-	return &domains[0], nil
-}
-
-// UpdateDomain updates a domain's settings
-func (c *Client) UpdateDomain(name string, update *DomainUpdate) (*Domain, error) {
-	resp, err := c.doRequest("PUT", fmt.Sprintf("/domain/%s", name), update)
-	if err != nil {
-		return nil, err
-	}
-	var domains []Domain
-	if err := json.Unmarshal(resp, &domains); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	if len(domains) == 0 {
-		return nil, fmt.Errorf("domain not found: %s", name)
-	}
-	return &domains[0], nil
+	return parseSingle[Domain](resp)
 }
 
 // GetDomainPreferences retrieves domain preferences
-func (c *Client) GetDomainPreferences(name string) (*DomainPreferences, error) {
-	resp, err := c.doRequest("GET", fmt.Sprintf("/domain/%s/preferences", name), nil)
+func (c *Client) GetDomainPreferences(ctx context.Context, name string) (*DomainPreferences, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/domain/"+url.PathEscape(name)+"/preferences", nil)
 	if err != nil {
 		return nil, err
 	}
-	var prefs []DomainPreferences
-	if err := json.Unmarshal(resp, &prefs); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	if len(prefs) == 0 {
-		return nil, fmt.Errorf("domain preferences not found: %s", name)
-	}
-	return &prefs[0], nil
-}
-
-// UpdateDomainPreferences updates domain preferences
-func (c *Client) UpdateDomainPreferences(name string, prefs *DomainPreferences) (*DomainPreferences, error) {
-	resp, err := c.doRequest("PUT", fmt.Sprintf("/domain/%s/preferences", name), prefs)
-	if err != nil {
-		return nil, err
-	}
-	var updated []DomainPreferences
-	if err := json.Unmarshal(resp, &updated); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	if len(updated) == 0 {
-		return nil, fmt.Errorf("domain preferences not found: %s", name)
-	}
-	return &updated[0], nil
-}
-
-// GetDomainNameservers retrieves all nameservers for a domain
-func (c *Client) GetDomainNameservers(domain string) ([]DomainNameserver, error) {
-	resp, err := c.doRequest("GET", fmt.Sprintf("/domain/%s/nameserver", domain), nil)
-	if err != nil {
-		return nil, err
-	}
-	var nameservers []DomainNameserver
-	if err := json.Unmarshal(resp, &nameservers); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return nameservers, nil
-}
-
-// GetDomainNameserver retrieves a specific nameserver
-func (c *Client) GetDomainNameserver(domain, hostname string) (*DomainNameserver, error) {
-	resp, err := c.doRequest("GET", fmt.Sprintf("/domain/%s/nameserver/%s", domain, hostname), nil)
-	if err != nil {
-		return nil, err
-	}
-	var nameservers []DomainNameserver
-	if err := json.Unmarshal(resp, &nameservers); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	if len(nameservers) == 0 {
-		return nil, fmt.Errorf("nameserver not found: %s", hostname)
-	}
-	return &nameservers[0], nil
-}
-
-// CreateDomainNameservers creates nameservers for a domain (replaces all)
-func (c *Client) CreateDomainNameservers(domain string, nameservers []DomainNameserver) ([]DomainNameserver, error) {
-	resp, err := c.doRequest("POST", fmt.Sprintf("/domain/%s/nameserver", domain), nameservers)
-	if err != nil {
-		return nil, err
-	}
-	var created []DomainNameserver
-	if err := json.Unmarshal(resp, &created); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	return created, nil
-}
-
-// UpdateDomainNameserver updates a specific nameserver
-func (c *Client) UpdateDomainNameserver(domain, hostname string, ns *DomainNameserver) (*DomainNameserver, error) {
-	resp, err := c.doRequest("PUT", fmt.Sprintf("/domain/%s/nameserver/%s", domain, hostname), ns)
-	if err != nil {
-		return nil, err
-	}
-	var updated []DomainNameserver
-	if err := json.Unmarshal(resp, &updated); err != nil {
-		return nil, fmt.Errorf("error parsing response: %w", err)
-	}
-	if len(updated) == 0 {
-		return nil, fmt.Errorf("nameserver not found after update: %s", hostname)
-	}
-	return &updated[0], nil
-}
-
-// DeleteDomainNameserver deletes a nameserver
-func (c *Client) DeleteDomainNameserver(domain, hostname string) error {
-	_, err := c.doRequest("DELETE", fmt.Sprintf("/domain/%s/nameserver/%s", domain, hostname), nil)
-	return err
+	return parseSingle[DomainPreferences](resp)
 }

@@ -119,7 +119,7 @@ func (d *DomainDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 		return
 	}
 
-	domain, err := d.client.GetDomain(data.Name.ValueString())
+	domain, err := d.client.GetDomain(ctx, data.Name.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Reading Domain",
@@ -129,7 +129,7 @@ func (d *DomainDataSource) Read(ctx context.Context, req datasource.ReadRequest,
 	}
 
 	// Also get preferences for renewal_notifications
-	prefs, err := d.client.GetDomainPreferences(data.Name.ValueString())
+	prefs, err := d.client.GetDomainPreferences(ctx, data.Name.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error Reading Domain Preferences",

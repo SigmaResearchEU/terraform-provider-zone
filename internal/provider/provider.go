@@ -30,13 +30,13 @@ type ZoneProviderModel struct {
 }
 
 func (p *ZoneProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
-	resp.TypeName = "zoneeu"
+	resp.TypeName = "zone"
 	resp.Version = p.version
 }
 
 func (p *ZoneProvider) Schema(ctx context.Context, req provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "The Zone.EU provider is used to manage DNS records and domains on Zone.EU hosting platform.",
+		Description: "The Zone.EU provider manages DNS records on the Zone.EU hosting platform.",
 		Attributes: map[string]schema.Attribute{
 			"username": schema.StringAttribute{
 				Description: "The ZoneID username used to authenticate with Zone.EU API. Can also be set via the ZONE_EU_USERNAME environment variable.",
@@ -96,8 +96,6 @@ func (p *ZoneProvider) Resources(ctx context.Context) []func() resource.Resource
 		NewDNSTLSARecordResource,
 		NewDNSSSHFPRecordResource,
 		NewDNSURLRecordResource,
-		NewDomainResource,
-		NewDomainNameserverResource,
 	}
 }
 
@@ -115,4 +113,3 @@ func New(version string) func() provider.Provider {
 		}
 	}
 }
-

@@ -1,12 +1,10 @@
-package tools
 //go:build generate
 
+package tools
 
+import (
+	// document generation
+	_ "github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs"
+)
 
-
-
-
-
-
-
-//go:generate go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs generate --provider-dir ..)	_ "github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs"	// document generationimport (package tools
+//go:generate go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs generate --provider-dir .. --provider-name zone

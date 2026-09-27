@@ -5,8 +5,8 @@ import (
 	"flag"
 	"log"
 
+	"github.com/SigmaResearchEU/terraform-provider-zone/internal/provider"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
-	"github.com/zone-eu/terraform-provider-zone/internal/provider"
 )
 
 var (
@@ -20,12 +20,11 @@ func main() {
 	flag.Parse()
 
 	err := providerserver.Serve(context.Background(), provider.New(version), providerserver.ServeOpts{
-		Address:         "registry.terraform.io/kepsic/zoneeu",
+		Address:         "registry.terraform.io/sigmaresearcheu/zone",
 		Debug:           debug,
-		ProtocolVersion: 5,
+		ProtocolVersion: 6,
 	})
 	if err != nil {
 		log.Fatal(err.Error())
 	}
 }
-

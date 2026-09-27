@@ -5,126 +5,88 @@ import (
 	"os"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-testing/helper/acctest"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 )
 
-func TestAccDNSARecordResource(t *testing.T) {
-	domain := os.Getenv("ZONE_EU_TEST_DOMAIN")
-	if domain == "" {
+// testAccName returns a random FQDN under the test zone. The API rejects short
+// names with 422 invalid_host, so acceptance configs always use FQDNs.
+func testAccName(t *testing.T, zone string) string {
+	t.Helper()
+	return fmt.Sprintf("tf-acc-%s.%s", acctest.RandStringFromCharSet(8, acctest.CharSetAlphaNum), zone)
+}
+
+func testAccZone(t *testing.T) string {
+	t.Helper()
+	zone := os.Getenv("ZONE_EU_TEST_DOMAIN")
+	if zone == "" {
 		t.Skip("ZONE_EU_TEST_DOMAIN must be set for acceptance tests")
 	}
+	return zone
+}
 
-	resourceName := "zoneeu_dns_a_record.test"
+func TestAccDNSARecordResource(t *testing.T) {
+	zone := testAccZone(t)
+	name := testAccName(t, zone)
+	resourceName := "zone_dns_a_record.test"
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
-			// Create and Read testing
 			{
-				Config: testAccDNSARecordResourceConfig(domain, "test-acc", "192.168.1.1"),
+				Config: testAccDNSRecordConfig("zone_dns_a_record", zone, name, "192.0.2.1"),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(resourceName, "domain", domain),
-					resource.TestCheckResourceAttr(resourceName, "name", "test-acc"),
-					resource.TestCheckResourceAttr(resourceName, "destination", "192.168.1.1"),
-					resource.TestCheckResourceAttrSet(resourceName, "id"),
+					resource.TestCheckResourceAttr(resourceName, "zone", zone),
+					resource.TestCheckResourceAttr(resourceName, "name", name),
+					resource.TestCheckResourceAttr(resourceName, "destination", "192.0.2.1"),
+					resource.TestCheckResourceAttrSet(resourceName, "record_id"),
 				),
 			},
-			// ImportState testing
 			{
-				ResourceName:            resourceName,
-				ImportState:             true,
-				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"force_recreate"},
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
-			// Update testing
 			{
-				Config: testAccDNSARecordResourceConfig(domain, "test-acc", "192.168.1.2"),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(resourceName, "destination", "192.168.1.2"),
-				),
+				Config: testAccDNSRecordConfig("zone_dns_a_record", zone, name, "192.0.2.2"),
+				Check:  resource.TestCheckResourceAttr(resourceName, "destination", "192.0.2.2"),
 			},
-			// Delete testing automatically occurs in TestCase
 		},
 	})
-}
-
-func testAccDNSARecordResourceConfig(domain, name, destination string) string {
-	return fmt.Sprintf(`
-resource "zoneeu_dns_a_record" "test" {
-  domain      = %[1]q
-  name        = %[2]q
-  destination = %[3]q
-}
-`, domain, name, destination)
 }
 
 func TestAccDNSTXTRecordResource(t *testing.T) {
-	domain := os.Getenv("ZONE_EU_TEST_DOMAIN")
-	if domain == "" {
-		t.Skip("ZONE_EU_TEST_DOMAIN must be set for acceptance tests")
-	}
-
-	resourceName := "zoneeu_dns_txt_record.test"
-
-	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { testAccPreCheck(t) },
-		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-		Steps: []resource.TestStep{
-			// Create and Read testing
-			{
-				Config: testAccDNSTXTRecordResourceConfig(domain, "test-acc-txt", "v=spf1 include:test.com ~all"),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(resourceName, "domain", domain),
-					resource.TestCheckResourceAttr(resourceName, "name", "test-acc-txt"),
-					resource.TestCheckResourceAttrSet(resourceName, "id"),
-				),
-			},
-			// Delete testing automatically occurs in TestCase
-		},
-	})
-}
-
-func testAccDNSTXTRecordResourceConfig(domain, name, destination string) string {
-	return fmt.Sprintf(`
-resource "zoneeu_dns_txt_record" "test" {
-  domain      = %[1]q
-  name        = %[2]q
-  destination = %[3]q
-}
-`, domain, name, destination)
-}
-
-func TestAccDNSARecordResource_ForceRecreate(t *testing.T) {
-	domain := os.Getenv("ZONE_EU_TEST_DOMAIN")
-	if domain == "" {
-		t.Skip("ZONE_EU_TEST_DOMAIN must be set for acceptance tests")
-	}
-
-	resourceName := "zoneeu_dns_a_record.test"
+	zone := testAccZone(t)
+	name := testAccName(t, zone)
+	resourceName := "zone_dns_txt_record.test"
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: testAccDNSARecordResourceConfigForceRecreate(domain, "test-force", "192.168.1.100"),
+				Config: testAccDNSRecordConfig("zone_dns_txt_record", zone, name, "v=spf1 -all"),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(resourceName, "force_recreate", "true"),
-					resource.TestCheckResourceAttr(resourceName, "destination", "192.168.1.100"),
+					resource.TestCheckResourceAttr(resourceName, "name", name),
+					resource.TestCheckResourceAttr(resourceName, "destination", "v=spf1 -all"),
 				),
+			},
+			{
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})
 }
 
-func testAccDNSARecordResourceConfigForceRecreate(domain, name, destination string) string {
+func testAccDNSRecordConfig(resourceType, zone, name, destination string) string {
 	return fmt.Sprintf(`
-resource "zoneeu_dns_a_record" "test" {
-  domain         = %[1]q
-  name           = %[2]q
-  destination    = %[3]q
-  force_recreate = true
+resource %[1]q "test" {
+  zone        = %[2]q
+  name        = %[3]q
+  destination = %[4]q
 }
-`, domain, name, destination)
+`, resourceType, zone, name, destination)
 }

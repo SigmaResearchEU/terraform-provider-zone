@@ -30,8 +30,8 @@ func TestAccDomainDataSource(t *testing.T) {
 			{
 				Config: testAccDomainDataSourceConfig(domain),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("data.zoneeu_domain.test", "name", domain),
-					resource.TestCheckResourceAttrSet("data.zoneeu_domain.test", "expires"),
+					resource.TestCheckResourceAttr("data.zone_domain.test", "name", domain),
+					resource.TestCheckResourceAttrSet("data.zone_domain.test", "expires"),
 				),
 			},
 		},
@@ -40,7 +40,7 @@ func TestAccDomainDataSource(t *testing.T) {
 
 func testAccDomainDataSourceConfig(domain string) string {
 	return `
-data "zoneeu_domain" "test" {
+data "zone_domain" "test" {
   name = "` + domain + `"
 }
 `

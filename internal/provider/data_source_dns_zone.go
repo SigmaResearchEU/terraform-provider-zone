@@ -21,8 +21,10 @@ type DNSZoneDataSource struct {
 }
 
 type DNSZoneDataSourceModel struct {
-	ID   types.String `tfsdk:"id"`
-	Name types.String `tfsdk:"name"`
+	ID     types.String `tfsdk:"id"`
+	Name   types.String `tfsdk:"name"`
+	Active types.Bool   `tfsdk:"active"`
+	IPv6   types.Bool   `tfsdk:"ipv6"`
 }
 
 func (d *DNSZoneDataSource) Metadata(ctx context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
@@ -40,6 +42,14 @@ func (d *DNSZoneDataSource) Schema(ctx context.Context, req datasource.SchemaReq
 			"name": schema.StringAttribute{
 				Description: "The DNS zone name (domain name, e.g., example.com).",
 				Required:    true,
+			},
+			"active": schema.BoolAttribute{
+				Description: "Whether the zone is active.",
+				Computed:    true,
+			},
+			"ipv6": schema.BoolAttribute{
+				Description: "Whether IPv6 is enabled for the zone.",
+				Computed:    true,
 			},
 		},
 	}
@@ -69,14 +79,15 @@ func (d *DNSZoneDataSource) Read(ctx context.Context, req datasource.ReadRequest
 		return
 	}
 
-	// Validate zone exists by making an API call
-	_, err := d.client.GetZone(data.Name.ValueString())
+	zone, err := d.client.GetDNSZone(ctx, data.Name.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read zone, got error: %s", err))
 		return
 	}
 
 	data.ID = data.Name
+	data.Active = types.BoolValue(zone.Active)
+	data.IPv6 = types.BoolValue(zone.IPv6)
 
 	tflog.Trace(ctx, "read DNS zone data source")
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)

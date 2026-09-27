@@ -2,9 +2,12 @@ name: Test
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
+  # Acceptance tests create and delete real records in ZONE_EU_TEST_DOMAIN,
+  # so they only run on demand.
+  workflow_dispatch:
 
 jobs:
   build:
@@ -15,7 +18,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
           cache: true
 
       - name: Build
@@ -23,6 +26,11 @@ jobs:
 
       - name: Test
         run: go test -v -cover ./...
+
+      - name: Docs are up to date
+        run: |
+          go generate ./tools/...
+          git diff --exit-code -- docs/
 
   lint:
     runs-on: ubuntu-latest
@@ -32,17 +40,17 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
           version: latest
 
   acceptance:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch'
     needs: [build, lint]
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +58,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
           cache: true
 
       - name: Set up Terraform

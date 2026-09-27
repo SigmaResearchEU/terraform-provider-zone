@@ -1,8 +1,8 @@
 HOSTNAME=registry.terraform.io
-NAMESPACE=kepsic
-NAME=zoneeu
+NAMESPACE=sigmaresearcheu
+NAME=zone
 BINARY=terraform-provider-${NAME}
-VERSION=1.0.1
+VERSION=0.0.1-dev
 OS_ARCH=$(shell go env GOOS)_$(shell go env GOARCH)
 
 default: build

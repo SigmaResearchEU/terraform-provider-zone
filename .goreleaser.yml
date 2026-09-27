@@ -1,3 +1,5 @@
+# Release layout required by the Terraform Registry:
+# https://developer.hashicorp.com/terraform/registry/providers/publishing
 version: 2
 
 before:
@@ -13,25 +15,35 @@ builds:
     ldflags:
       - '-s -w -X main.version={{.Version}}'
     goos:
+      - freebsd
+      - windows
       - linux
       - darwin
-      - windows
     goarch:
       - amd64
+      - '386'
+      - arm
       - arm64
+    ignore:
+      - goos: darwin
+        goarch: '386'
     binary: '{{ .ProjectName }}_v{{ .Version }}'
 
 archives:
-  - format: zip
+  - formats: [zip]
     name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
 
 checksum:
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
   name_template: '{{ .ProjectName }}_{{ .Version }}_SHA256SUMS'
   algorithm: sha256
 
 signs:
   - artifacts: checksum
     args:
+      # The registry only accepts RSA/DSA keys; ECC keys are rejected.
       - "--batch"
       - "--local-user"
       - "{{ .Env.GPG_FINGERPRINT }}"
@@ -41,13 +53,11 @@ signs:
       - "${artifact}"
 
 release:
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
+  # The registry ignores draft releases.
   draft: false
-  prerelease: auto
 
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - '^docs:'
-      - '^test:'
-      - '^ci:'
+  disable: true

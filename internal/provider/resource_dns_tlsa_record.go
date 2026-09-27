@@ -9,7 +9,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -37,7 +36,6 @@ type DNSTLSARecordResourceModel struct {
 	Selector         types.Int64  `tfsdk:"selector"`
 	MatchingType     types.Int64  `tfsdk:"matching_type"`
 	RecordID         types.String `tfsdk:"record_id"`
-	ForceRecreate    types.Bool   `tfsdk:"force_recreate"`
 }
 
 func (r *DNSTLSARecordResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -98,12 +96,6 @@ func (r *DNSTLSARecordResource) Schema(ctx context.Context, req resource.SchemaR
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"force_recreate": schema.BoolAttribute{
-				Description: "If true, delete existing record with same name before creating. Default: false.",
-				Optional:    true,
-				Computed:    true,
-				Default:     booldefault.StaticBool(false),
-			},
 		},
 	}
 }
@@ -132,43 +124,6 @@ func (r *DNSTLSARecordResource) Create(ctx context.Context, req resource.CreateR
 		return
 	}
 
-	// If force_recreate is true, check for existing record and update it instead of creating
-	if data.ForceRecreate.ValueBool() {
-		existing, err := r.client.FindTLSARecordByNameWithContext(ctx, data.Zone.ValueString(), data.Name.ValueString())
-		if err != nil {
-			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to check for existing TLSA record, got error: %s", err))
-			return
-		}
-		if existing != nil {
-			tflog.Info(ctx, "force_recreate: updating existing TLSA record instead of creating new", map[string]interface{}{
-				"zone":      data.Zone.ValueString(),
-				"name":      data.Name.ValueString(),
-				"record_id": existing.ID,
-			})
-
-			record := &DNSRecord{
-				Name:             data.Name.ValueString(),
-				Destination:      data.Destination.ValueString(),
-				CertificateUsage: int(data.CertificateUsage.ValueInt64()),
-				Selector:         int(data.Selector.ValueInt64()),
-				MatchingType:     int(data.MatchingType.ValueInt64()),
-			}
-
-			updated, err := r.client.UpdateTLSARecordWithContext(ctx, data.Zone.ValueString(), existing.ID, record)
-			if err != nil {
-				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update existing TLSA record for force_recreate, got error: %s", err))
-				return
-			}
-
-			data.ID = types.StringValue(fmt.Sprintf("%s/%s", data.Zone.ValueString(), updated.ID))
-			data.RecordID = types.StringValue(updated.ID)
-
-			tflog.Trace(ctx, "updated existing TLSA record via force_recreate")
-			resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
-			return
-		}
-	}
-
 	record := &DNSRecord{
 		Name:             data.Name.ValueString(),
 		Destination:      data.Destination.ValueString(),
@@ -177,23 +132,8 @@ func (r *DNSTLSARecordResource) Create(ctx context.Context, req resource.CreateR
 		MatchingType:     int(data.MatchingType.ValueInt64()),
 	}
 
-	created, err := r.client.CreateTLSARecordWithContext(ctx, data.Zone.ValueString(), record)
+	created, err := r.client.CreateRecord(ctx, recordTypeTLSA, data.Zone.ValueString(), record)
 	if err != nil {
-		// Handle zone_conflict by adopting existing record into state
-		if strings.Contains(err.Error(), "zone_conflict") {
-			tflog.Info(ctx, "Record already exists (zone_conflict), adopting into state", map[string]interface{}{
-				"zone": data.Zone.ValueString(),
-				"name": data.Name.ValueString(),
-			})
-			existing, findErr := r.client.FindTLSARecordByNameWithContext(ctx, data.Zone.ValueString(), data.Name.ValueString())
-			if findErr == nil && existing != nil {
-				data.ID = types.StringValue(fmt.Sprintf("%s/%s", data.Zone.ValueString(), existing.ID))
-				data.RecordID = types.StringValue(existing.ID)
-				resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
-				return
-			}
-			// If we couldn't find/adopt, fall through to error
-		}
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create TLSA record, got error: %s", err))
 		return
 	}
@@ -218,9 +158,9 @@ func (r *DNSTLSARecordResource) Read(ctx context.Context, req resource.ReadReque
 		return
 	}
 
-	record, err := r.client.GetTLSARecordWithContext(ctx, zone, recordID)
+	record, err := r.client.GetRecord(ctx, recordTypeTLSA, zone, recordID)
 	if err != nil {
-		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") {
+		if isNotFound(err) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
@@ -260,45 +200,8 @@ func (r *DNSTLSARecordResource) Update(ctx context.Context, req resource.UpdateR
 		MatchingType:     int(data.MatchingType.ValueInt64()),
 	}
 
-	_, err = r.client.UpdateTLSARecordWithContext(ctx, zone, recordID, record)
+	_, err = r.client.UpdateRecord(ctx, recordTypeTLSA, zone, recordID, record)
 	if err != nil {
-		// Handle zone_conflict when force_recreate is enabled
-		if strings.Contains(err.Error(), "zone_conflict") && data.ForceRecreate.ValueBool() {
-			tflog.Info(ctx, "zone_conflict during update with force_recreate=true, deleting all duplicates and recreating")
-			
-			// Find and delete ALL records with this name (handles duplicates)
-			allRecords, findErr := r.client.FindAllTLSARecordsByNameWithContext(ctx, zone, data.Name.ValueString())
-			if findErr != nil {
-				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to find existing records: %s", findErr))
-				return
-			}
-			
-			// Delete all matching records
-			for _, rec := range allRecords {
-				deleteErr := r.client.DeleteTLSARecordWithContext(ctx, zone, rec.ID)
-				if deleteErr != nil {
-					// Ignore 404 errors
-					if !strings.Contains(deleteErr.Error(), "404") {
-						tflog.Warn(ctx, fmt.Sprintf("Failed to delete duplicate record %s: %s", rec.ID, deleteErr))
-					}
-				}
-			}
-			
-			// Create fresh record
-			created, createErr := r.client.CreateTLSARecordWithContext(ctx, zone, record)
-			if createErr != nil {
-				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to recreate TLSA record after deleting duplicates: %s", createErr))
-				return
-			}
-			
-			// Update state with new record ID
-			data.RecordID = types.StringValue(created.ID)
-			data.ID = types.StringValue(fmt.Sprintf("%s/%s", zone, created.ID))
-			tflog.Trace(ctx, "recreated TLSA record after deleting duplicates")
-			resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
-			return
-		}
-		
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update TLSA record, got error: %s", err))
 		return
 	}
@@ -320,10 +223,10 @@ func (r *DNSTLSARecordResource) Delete(ctx context.Context, req resource.DeleteR
 		return
 	}
 
-	err = r.client.DeleteTLSARecordWithContext(ctx, zone, recordID)
+	err = r.client.DeleteRecord(ctx, recordTypeTLSA, zone, recordID)
 	if err != nil {
 		// Ignore 404 errors - resource is already deleted
-		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") {
+		if isNotFound(err) {
 			return
 		}
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete TLSA record, got error: %s", err))

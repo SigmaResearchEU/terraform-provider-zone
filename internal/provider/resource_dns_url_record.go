@@ -11,7 +11,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -31,13 +30,12 @@ type DNSURLRecordResource struct {
 }
 
 type DNSURLRecordResourceModel struct {
-	ID            types.String `tfsdk:"id"`
-	Zone          types.String `tfsdk:"zone"`
-	Name          types.String `tfsdk:"name"`
-	Destination   types.String `tfsdk:"destination"`
-	RedirectType  types.Int64  `tfsdk:"redirect_type"`
-	RecordID      types.String `tfsdk:"record_id"`
-	ForceRecreate types.Bool   `tfsdk:"force_recreate"`
+	ID           types.String `tfsdk:"id"`
+	Zone         types.String `tfsdk:"zone"`
+	Name         types.String `tfsdk:"name"`
+	Destination  types.String `tfsdk:"destination"`
+	RedirectType types.Int64  `tfsdk:"redirect_type"`
+	RecordID     types.String `tfsdk:"record_id"`
 }
 
 func (r *DNSURLRecordResource) Metadata(ctx context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -90,12 +88,6 @@ func (r *DNSURLRecordResource) Schema(ctx context.Context, req resource.SchemaRe
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"force_recreate": schema.BoolAttribute{
-				Description: "If true, delete existing record with same name before creating. Default: false.",
-				Optional:    true,
-				Computed:    true,
-				Default:     booldefault.StaticBool(false),
-			},
 		},
 	}
 }
@@ -124,64 +116,14 @@ func (r *DNSURLRecordResource) Create(ctx context.Context, req resource.CreateRe
 		return
 	}
 
-	// If force_recreate is true, check for existing record and update it instead of creating
-	if data.ForceRecreate.ValueBool() {
-		existing, err := r.client.FindURLRecordByNameWithContext(ctx, data.Zone.ValueString(), data.Name.ValueString())
-		if err != nil {
-			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to check for existing URL record, got error: %s", err))
-			return
-		}
-		if existing != nil {
-			tflog.Info(ctx, "force_recreate: updating existing URL record instead of creating new", map[string]interface{}{
-				"zone":      data.Zone.ValueString(),
-				"name":      data.Name.ValueString(),
-				"record_id": existing.ID,
-			})
-
-			record := &DNSRecord{
-				Name:        data.Name.ValueString(),
-				Destination: data.Destination.ValueString(),
-				Type:        int(data.RedirectType.ValueInt64()),
-			}
-
-			updated, err := r.client.UpdateURLRecordWithContext(ctx, data.Zone.ValueString(), existing.ID, record)
-			if err != nil {
-				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update existing URL record for force_recreate, got error: %s", err))
-				return
-			}
-
-			data.ID = types.StringValue(fmt.Sprintf("%s/%s", data.Zone.ValueString(), updated.ID))
-			data.RecordID = types.StringValue(updated.ID)
-
-			tflog.Trace(ctx, "updated existing URL record via force_recreate")
-			resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
-			return
-		}
-	}
-
 	record := &DNSRecord{
 		Name:        data.Name.ValueString(),
 		Destination: data.Destination.ValueString(),
 		Type:        int(data.RedirectType.ValueInt64()),
 	}
 
-	created, err := r.client.CreateURLRecordWithContext(ctx, data.Zone.ValueString(), record)
+	created, err := r.client.CreateRecord(ctx, recordTypeURL, data.Zone.ValueString(), record)
 	if err != nil {
-		// Handle zone_conflict by adopting existing record into state
-		if strings.Contains(err.Error(), "zone_conflict") {
-			tflog.Info(ctx, "Record already exists (zone_conflict), adopting into state", map[string]interface{}{
-				"zone": data.Zone.ValueString(),
-				"name": data.Name.ValueString(),
-			})
-			existing, findErr := r.client.FindURLRecordByNameWithContext(ctx, data.Zone.ValueString(), data.Name.ValueString())
-			if findErr == nil && existing != nil {
-				data.ID = types.StringValue(fmt.Sprintf("%s/%s", data.Zone.ValueString(), existing.ID))
-				data.RecordID = types.StringValue(existing.ID)
-				resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
-				return
-			}
-			// If we couldn't find/adopt, fall through to error
-		}
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to create URL record, got error: %s", err))
 		return
 	}
@@ -206,9 +148,9 @@ func (r *DNSURLRecordResource) Read(ctx context.Context, req resource.ReadReques
 		return
 	}
 
-	record, err := r.client.GetURLRecordWithContext(ctx, zone, recordID)
+	record, err := r.client.GetRecord(ctx, recordTypeURL, zone, recordID)
 	if err != nil {
-		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") {
+		if isNotFound(err) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
@@ -244,45 +186,8 @@ func (r *DNSURLRecordResource) Update(ctx context.Context, req resource.UpdateRe
 		Type:        int(data.RedirectType.ValueInt64()),
 	}
 
-	_, err = r.client.UpdateURLRecordWithContext(ctx, zone, recordID, record)
+	_, err = r.client.UpdateRecord(ctx, recordTypeURL, zone, recordID, record)
 	if err != nil {
-		// Handle zone_conflict when force_recreate is enabled
-		if strings.Contains(err.Error(), "zone_conflict") && data.ForceRecreate.ValueBool() {
-			tflog.Info(ctx, "zone_conflict during update with force_recreate=true, deleting all duplicates and recreating")
-			
-			// Find and delete ALL records with this name (handles duplicates)
-			allRecords, findErr := r.client.FindAllURLRecordsByNameWithContext(ctx, zone, data.Name.ValueString())
-			if findErr != nil {
-				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to find existing records: %s", findErr))
-				return
-			}
-			
-			// Delete all matching records
-			for _, rec := range allRecords {
-				deleteErr := r.client.DeleteURLRecordWithContext(ctx, zone, rec.ID)
-				if deleteErr != nil {
-					// Ignore 404 errors
-					if !strings.Contains(deleteErr.Error(), "404") {
-						tflog.Warn(ctx, fmt.Sprintf("Failed to delete duplicate record %s: %s", rec.ID, deleteErr))
-					}
-				}
-			}
-			
-			// Create fresh record
-			created, createErr := r.client.CreateURLRecordWithContext(ctx, zone, record)
-			if createErr != nil {
-				resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to recreate URL record after deleting duplicates: %s", createErr))
-				return
-			}
-			
-			// Update state with new record ID
-			data.RecordID = types.StringValue(created.ID)
-			data.ID = types.StringValue(fmt.Sprintf("%s/%s", zone, created.ID))
-			tflog.Trace(ctx, "recreated URL record after deleting duplicates")
-			resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
-			return
-		}
-		
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update URL record, got error: %s", err))
 		return
 	}
@@ -304,10 +209,10 @@ func (r *DNSURLRecordResource) Delete(ctx context.Context, req resource.DeleteRe
 		return
 	}
 
-	err = r.client.DeleteURLRecordWithContext(ctx, zone, recordID)
+	err = r.client.DeleteRecord(ctx, recordTypeURL, zone, recordID)
 	if err != nil {
 		// Ignore 404 errors - resource is already deleted
-		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") {
+		if isNotFound(err) {
 			return
 		}
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete URL record, got error: %s", err))
