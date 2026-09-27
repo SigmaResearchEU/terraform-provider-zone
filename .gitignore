@@ -1,0 +1,35 @@
+# Build artifacts
+terraform-provider-*
+*.exe
+*.dll
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Go
+vendor/
+*.test
+coverage.out
+coverage.html
+
+# Local development
+.env
+*.local
+
+# Releases
+dist/
