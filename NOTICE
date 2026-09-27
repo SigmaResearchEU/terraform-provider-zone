@@ -1,0 +1,12 @@
+terraform-provider-zone
+Copyright (c) 2026 Sigma Research OÜ
+
+This product is derived from terraform-provider-zone_eu
+(https://github.com/kepsic/terraform-provider-zone_eu), commit
+fbe9057bb87b8a0b9b1105c13efd6850f4c58c77, by Andres Kepler, licensed under
+the Mozilla Public License 2.0. That work was itself built on an archived
+HashiCorp Terraform provider scaffold, also MPL-2.0.
+
+The source of this product, including modifications, is available at
+https://github.com/SigmaResearchEU/terraform-provider-zone under the same
+license.
