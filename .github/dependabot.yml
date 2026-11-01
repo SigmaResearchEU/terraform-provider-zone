@@ -1,0 +1,19 @@
+---
+# Keeps the GitHub Actions pins current. Every action in .github/workflows is
+# pinned to a full commit SHA with its tag as a comment
+# (`uses: owner/repo@<sha> # v4`), since 2026-11-01 (security audit G3,
+# remediation plan 1.4). A tag can be moved by whoever controls the action's
+# repo, and the release workflow hands crazy-max/ghaction-import-gpg the GPG
+# signing key. A SHA cannot be moved. Dependabot bumps the SHA and the
+# comment together. Grouped into one weekly PR.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
