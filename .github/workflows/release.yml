@@ -10,6 +10,9 @@ permissions:
 
 jobs:
   goreleaser:
+    # GPG_PRIVATE_KEY and PASSPHRASE are secrets of the `release` environment,
+    # which admits only v* tags (remediation plan 1.3).
+    environment: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
